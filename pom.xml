@@ -40,6 +40,7 @@
         <arrow.version>15.0.2</arrow.version>
         <adbc.version>0.12.0</adbc.version>
         <target.java.version>11</target.java.version>
+        <kafka.version>1.17.2</kafka.version>
     </properties>
 
     <dependencies>
@@ -224,6 +225,13 @@
                     <groupId>org.apache.flink</groupId>
                 </exclusion>
             </exclusions>
+        </dependency>
+        <!-- flink kafka connector for kafka sink -->
+        <dependency>
+            <groupId>org.apache.flink</groupId>
+            <artifactId>flink-connector-kafka</artifactId>
+            <version>${kafka.version}</version>
+            <scope>provided</scope>
         </dependency>
         <!-- add drivers for FLINK-35055 -->
         <dependency>

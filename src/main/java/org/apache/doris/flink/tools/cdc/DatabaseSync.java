@@ -1,24 +1,11 @@
-// Licensed to the Apache Software Foundation (ASF) under one
-// or more contributor license agreements.  See the NOTICE file
-// distributed with this work for additional information
-// regarding copyright ownership.  The ASF licenses this file
-// to you under the Apache License, Version 2.0 (the
-// "License"); you may not use this file except in compliance
-// with the License.  You may obtain a copy of the License at
-//
-//   http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing,
-// software distributed under the License is distributed on an
-// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
-// KIND, either express or implied.  See the License for the
-// specific language governing permissions and limitations
-// under the License.
-
 package org.apache.doris.flink.tools.cdc;
 
+import org.apache.flink.api.common.serialization.SimpleStringSchema;
 import org.apache.flink.api.java.tuple.Tuple2;
 import org.apache.flink.configuration.Configuration;
+import org.apache.flink.connector.kafka.sink.KafkaRecordSerializationSchemaBuilder;
+import org.apache.flink.connector.kafka.sink.KafkaSink;
+import org.apache.flink.connector.kafka.sink.KafkaSinkBuilder;
 import org.apache.flink.streaming.api.datastream.DataStream;
 import org.apache.flink.streaming.api.datastream.DataStreamSource;
 import org.apache.flink.streaming.api.datastream.SingleOutputStreamOperator;
@@ -56,7 +43,6 @@ import java.util.Map;
 import java.util.Properties;
 import java.util.Set;
 import java.util.regex.Pattern;
-import java.util.stream.Collectors;
 
 import static org.apache.flink.cdc.debezium.utils.JdbcUrlUtils.PROPERTIES_PREFIX;
 
@@ -89,6 +75,9 @@ public abstract class DatabaseSync {
     protected String tableSuffix;
     protected boolean singleSink;
     protected final Map<String, String> tableMapping = new HashMap<>();
+
+    // Kafka配置
+    protected Configuration kafkaConfig;
 
     public abstract void registerDriver() throws SQLException;
 
@@ -169,8 +158,9 @@ public abstract class DatabaseSync {
         if (singleSink) {
             streamSource.sinkTo(buildDorisSink());
         } else {
+            ParsingProcessFunction processFunction = buildProcessFunction();
             SingleOutputStreamOperator<Void> parsedStream =
-                    streamSource.process(buildProcessFunction());
+                    streamSource.process(processFunction);
             for (Tuple2<String, String> dbTbl : dorisTables) {
                 OutputTag<String> recordOutputTag =
                         ParsingProcessFunction.createRecordOutputTag(dbTbl.f0, dbTbl.f1);
@@ -184,6 +174,18 @@ public abstract class DatabaseSync {
                         .setParallelism(sinkParallel)
                         .name(uidName)
                         .uid(uidName);
+
+                // 每个表单独一个Kafka topic，topic格式：库名.表名
+                if (kafkaConfig != null) {
+                    String kafkaTopic = dbTbl.f0 + "." + dbTbl.f1;
+                    DataStream<String> kafkaSideOutput = parsedStream.getSideOutput(
+                            ParsingProcessFunction.createKafkaOutputTag());
+                    kafkaSideOutput
+                            .sinkTo(buildKafkaSink(kafkaTopic))
+                            .setParallelism(sinkParallel)
+                            .name(uidName + "-kafka")
+                            .uid(uidName + "-kafka");
+                }
             }
         }
         return true;
@@ -580,5 +582,51 @@ public abstract class DatabaseSync {
     public DatabaseSync setTableSuffix(String tableSuffix) {
         this.tableSuffix = tableSuffix;
         return this;
+    }
+
+    public DatabaseSync setKafkaConfig(Configuration kafkaConfig) {
+        this.kafkaConfig = kafkaConfig;
+        return this;
+    }
+
+    /**
+     * 构建Kafka Sink
+     */
+    public KafkaSink<String> buildKafkaSink(String topic) {
+//        KafkaSink.Builder<String> builder = KafkaSink.builder();
+        KafkaSinkBuilder<String> builder = KafkaSink.builder();
+
+        String bootstrapServers = kafkaConfig.getString(DatabaseSyncConfig.KAFKA_BOOTSTRAP_SERVERS, "");
+        Preconditions.checkNotNull(bootstrapServers, "kafka bootstrap.servers is required");
+
+        // 设置broker地址
+        builder.setBootstrapServers(bootstrapServers);
+
+        // 设置序列化器
+        builder.setRecordSerializer(
+                new KafkaRecordSerializationSchemaBuilder()
+                        .setTopic(topic != null ? topic : getDefaultKafkaTopic())
+                        .setValueSerializationSchema(new SimpleStringSchema())
+                        .build());
+
+        // 设置其他自定义属性
+        for (Map.Entry<String, String> entry : kafkaConfig.toMap().entrySet()) {
+            String key = entry.getKey();
+            if (!key.equals(DatabaseSyncConfig.KAFKA_BOOTSTRAP_SERVERS)
+                    && !key.equals(DatabaseSyncConfig.KAFKA_TOPIC)
+                    && !key.equals(DatabaseSyncConfig.KAFKA_PARTITIONS)
+                    && !key.equals(DatabaseSyncConfig.KAFKA_REPLICATION_FACTOR)) {
+                builder.setProperty(key, entry.getValue());
+            }
+        }
+
+        return builder.build();
+    }
+
+    /**
+     * 获取默认Kafka topic（用于single sink模式）
+     */
+    protected String getDefaultKafkaTopic() {
+        return kafkaConfig.getString(DatabaseSyncConfig.KAFKA_TOPIC, "doris_cdc_default");
     }
 }
