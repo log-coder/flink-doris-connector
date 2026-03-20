@@ -7,6 +7,7 @@ import org.apache.flink.connector.kafka.sink.KafkaRecordSerializationSchemaBuild
 import org.apache.flink.connector.kafka.sink.KafkaSink;
 import org.apache.flink.connector.kafka.sink.KafkaSinkBuilder;
 import org.apache.flink.streaming.api.datastream.DataStream;
+import org.apache.doris.flink.tools.cdc.HeaderKafkaRecordSerializationSchema;
 import org.apache.flink.streaming.api.datastream.DataStreamSource;
 import org.apache.flink.streaming.api.datastream.SingleOutputStreamOperator;
 import org.apache.flink.streaming.api.environment.StreamExecutionEnvironment;
@@ -158,15 +159,23 @@ public abstract class DatabaseSync {
         if (singleSink) {
             streamSource.sinkTo(buildDorisSink());
         } else {
+            // 先解析数据，输出到Doris
             ParsingProcessFunction processFunction = buildProcessFunction();
             SingleOutputStreamOperator<Void> parsedStream =
                     streamSource.process(processFunction);
+
+            // 再处理Kafka数据
+            KafkaDataProcessFunction kafkaProcessFunction =
+                    new KafkaDataProcessFunction(database, converter);
+            parsedStream.getSideOutput(ParsingProcessFunction.createKafkaOutputTag())
+                    .process(kafkaProcessFunction);
+
             for (Tuple2<String, String> dbTbl : dorisTables) {
                 OutputTag<String> recordOutputTag =
                         ParsingProcessFunction.createRecordOutputTag(dbTbl.f0, dbTbl.f1);
                 DataStream<String> sideOutput = parsedStream.getSideOutput(recordOutputTag);
                 int sinkParallel =
-                        sinkConfig.getInteger(
+                        sinkConfig.get(
                                 DorisConfigOptions.SINK_PARALLELISM, sideOutput.getParallelism());
                 String uidName = getUidName(targetDbSet, dbTbl);
                 sideOutput
@@ -175,11 +184,17 @@ public abstract class DatabaseSync {
                         .name(uidName)
                         .uid(uidName);
 
-                // 每个表单独一个Kafka topic，topic格式：库名.表名
+                // 每个表单独一个Kafka topic，topic格式：库名.表名（去掉ods前缀）
                 if (kafkaConfig != null) {
+                    // 去掉ods前缀
                     String kafkaTopic = dbTbl.f0 + "." + dbTbl.f1;
-                    DataStream<String> kafkaSideOutput = parsedStream.getSideOutput(
-                            ParsingProcessFunction.createKafkaOutputTag());
+                    if (kafkaTopic.startsWith("ods_")) {
+                        kafkaTopic = kafkaTopic.substring(4);
+                    }
+                    // 获取该表对应的Kafka输出
+                    String tableKey = dbTbl.f0 + "." + dbTbl.f1;
+                    OutputTag<String> kafkaOutputTag = new OutputTag<String>("kafka-" + tableKey) {};
+                    DataStream<String> kafkaSideOutput = parsedStream.getSideOutput(kafkaOutputTag);
                     kafkaSideOutput
                             .sinkTo(buildKafkaSink(kafkaTopic))
                             .setParallelism(sinkParallel)
@@ -198,9 +213,6 @@ public abstract class DatabaseSync {
      */
     public String getUidName(Set<String> targetDbSet, Tuple2<String, String> dbTbl) {
         String uidName;
-        // Determine whether to proceed with multi-database synchronization.
-        // if yes, the UID is composed of `dbname_tablename`, otherwise it is composed of
-        // `tablename`.
         if (targetDbSet.size() > 1) {
             uidName = dbTbl.f0 + "_" + dbTbl.f1;
         } else {
@@ -211,11 +223,11 @@ public abstract class DatabaseSync {
     }
 
     private DorisConnectionOptions getDorisConnectionOptions() {
-        String fenodes = sinkConfig.getString(DorisConfigOptions.FENODES);
-        String benodes = sinkConfig.getString(DorisConfigOptions.BENODES);
-        String user = sinkConfig.getString(DorisConfigOptions.USERNAME);
-        String passwd = sinkConfig.getString(DorisConfigOptions.PASSWORD, "");
-        String jdbcUrl = sinkConfig.getString(DorisConfigOptions.JDBC_URL);
+        String fenodes = sinkConfig.get(DorisConfigOptions.FENODES);
+        String benodes = sinkConfig.get(DorisConfigOptions.BENODES);
+        String user = sinkConfig.get(DorisConfigOptions.USERNAME);
+        String passwd = sinkConfig.get(DorisConfigOptions.PASSWORD, "");
+        String jdbcUrl = sinkConfig.get(DorisConfigOptions.JDBC_URL);
         Preconditions.checkNotNull(fenodes, "fenodes is empty in sink-conf");
         Preconditions.checkNotNull(user, "username is empty in sink-conf");
         Preconditions.checkNotNull(jdbcUrl, "jdbcurl is empty in sink-conf");
@@ -294,7 +306,7 @@ public abstract class DatabaseSync {
                 .getOptional(DorisConfigOptions.SINK_IGNORE_UPDATE_BEFORE)
                 .ifPresent(executionBuilder::setIgnoreUpdateBefore);
 
-        if (!sinkConfig.getBoolean(DorisConfigOptions.SINK_ENABLE_2PC)) {
+        if (!sinkConfig.get(DorisConfigOptions.SINK_ENABLE_2PC)) {
             executionBuilder.disable2PC();
         } else if (sinkConfig.getOptional(DorisConfigOptions.SINK_ENABLE_2PC).isPresent()) {
             // force open 2pc
@@ -593,7 +605,6 @@ public abstract class DatabaseSync {
      * 构建Kafka Sink
      */
     public KafkaSink<String> buildKafkaSink(String topic) {
-//        KafkaSink.Builder<String> builder = KafkaSink.builder();
         KafkaSinkBuilder<String> builder = KafkaSink.builder();
 
         String bootstrapServers = kafkaConfig.getString(DatabaseSyncConfig.KAFKA_BOOTSTRAP_SERVERS, "");
@@ -602,12 +613,12 @@ public abstract class DatabaseSync {
         // 设置broker地址
         builder.setBootstrapServers(bootstrapServers);
 
-        // 设置序列化器
+        // 设置序列化器（带消息头）
+        String finalTopic = topic != null ? topic : getDefaultKafkaTopic();
         builder.setRecordSerializer(
-                new KafkaRecordSerializationSchemaBuilder()
-                        .setTopic(topic != null ? topic : getDefaultKafkaTopic())
-                        .setValueSerializationSchema(new SimpleStringSchema())
-                        .build());
+                new HeaderKafkaRecordSerializationSchema(
+                        finalTopic,
+                        new SimpleStringSchema()));
 
         // 设置其他自定义属性
         for (Map.Entry<String, String> entry : kafkaConfig.toMap().entrySet()) {

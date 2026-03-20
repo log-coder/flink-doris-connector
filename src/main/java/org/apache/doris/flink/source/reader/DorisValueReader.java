@@ -128,8 +128,7 @@ public class DorisValueReader extends ValueReader implements AutoCloseable {
 
         params.tablet_ids = Arrays.asList(partition.getTabletIds().toArray(new Long[] {}));
         params.opaqued_query_plan = partition.getQueryPlan();
-        // max row number of one read batch
-        Integer batchSize =
+        int batchSize =
                 readOptions.getRequestBatchSize() == null
                         ? DORIS_BATCH_SIZE_DEFAULT
                         : Math.min(readOptions.getRequestBatchSize(), DORIS_BATCH_SIZE_MAX);
