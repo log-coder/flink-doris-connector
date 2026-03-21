@@ -1,21 +1,18 @@
 package org.apache.doris.flink.tools.cdc;
 
-import org.apache.flink.api.common.serialization.SimpleStringSchema;
-import org.apache.flink.api.java.tuple.Tuple2;
-import org.apache.flink.configuration.Configuration;
-import org.apache.flink.connector.kafka.sink.KafkaRecordSerializationSchemaBuilder;
-import org.apache.flink.connector.kafka.sink.KafkaSink;
-import org.apache.flink.connector.kafka.sink.KafkaSinkBuilder;
-import org.apache.flink.streaming.api.datastream.DataStream;
-import org.apache.doris.flink.tools.cdc.HeaderKafkaRecordSerializationSchema;
-import org.apache.flink.streaming.api.datastream.DataStreamSource;
-import org.apache.flink.streaming.api.datastream.SingleOutputStreamOperator;
-import org.apache.flink.streaming.api.environment.StreamExecutionEnvironment;
-import org.apache.flink.util.CollectionUtil;
-import org.apache.flink.util.OutputTag;
-import org.apache.flink.util.Preconditions;
-import org.apache.flink.util.StringUtils;
+import static org.apache.flink.cdc.debezium.utils.JdbcUrlUtils.PROPERTIES_PREFIX;
 
+import java.sql.Connection;
+import java.sql.SQLException;
+import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.HashSet;
+import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.Properties;
+import java.util.Set;
+import java.util.regex.Pattern;
 import org.apache.doris.flink.catalog.doris.DorisSystem;
 import org.apache.doris.flink.catalog.doris.TableSchema;
 import org.apache.doris.flink.cfg.DorisConnectionOptions;
@@ -30,22 +27,21 @@ import org.apache.doris.flink.sink.writer.serializer.JsonDebeziumSchemaSerialize
 import org.apache.doris.flink.table.DorisConfigOptions;
 import org.apache.doris.flink.tools.cdc.converter.TableNameConverter;
 import org.apache.doris.flink.tools.cdc.utils.DorisTableUtil;
+import org.apache.flink.api.common.serialization.SimpleStringSchema;
+import org.apache.flink.api.java.tuple.Tuple2;
+import org.apache.flink.configuration.Configuration;
+import org.apache.flink.connector.kafka.sink.KafkaSink;
+import org.apache.flink.connector.kafka.sink.KafkaSinkBuilder;
+import org.apache.flink.streaming.api.datastream.DataStream;
+import org.apache.flink.streaming.api.datastream.DataStreamSource;
+import org.apache.flink.streaming.api.datastream.SingleOutputStreamOperator;
+import org.apache.flink.streaming.api.environment.StreamExecutionEnvironment;
+import org.apache.flink.util.CollectionUtil;
+import org.apache.flink.util.OutputTag;
+import org.apache.flink.util.Preconditions;
+import org.apache.flink.util.StringUtils;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
-
-import java.sql.Connection;
-import java.sql.SQLException;
-import java.util.ArrayList;
-import java.util.HashMap;
-import java.util.HashSet;
-import java.util.LinkedHashMap;
-import java.util.List;
-import java.util.Map;
-import java.util.Properties;
-import java.util.Set;
-import java.util.regex.Pattern;
-
-import static org.apache.flink.cdc.debezium.utils.JdbcUrlUtils.PROPERTIES_PREFIX;
 
 public abstract class DatabaseSync {
     private static final Logger LOG = LoggerFactory.getLogger(DatabaseSync.class);
@@ -159,48 +155,45 @@ public abstract class DatabaseSync {
         if (singleSink) {
             streamSource.sinkTo(buildDorisSink());
         } else {
-            // 先解析数据，输出到Doris
-            ParsingProcessFunction processFunction = buildProcessFunction();
-            SingleOutputStreamOperator<Void> parsedStream =
-                    streamSource.process(processFunction);
+            // 先解析数据，输出到Doris和Kafka
+            SingleOutputStreamOperator<Void> parsedStream = streamSource.process(new ParsingProcessFunction(database, converter));
 
-            // 再处理Kafka数据
-            KafkaDataProcessFunction kafkaProcessFunction =
-                    new KafkaDataProcessFunction(database, converter);
-            parsedStream.getSideOutput(ParsingProcessFunction.createKafkaOutputTag())
-                    .process(kafkaProcessFunction);
+            // 使用schemaList来获取原始db.table，构造Kafka侧流
+            for (SourceSchema schema : schemaList) {
+                String originalDb = schema.getDatabaseName();
+                String originalTable = schema.getTableName();
 
-            for (Tuple2<String, String> dbTbl : dorisTables) {
+                // Doris侧流（使用转换后的表名）
+                String dorisDb = StringUtils.isNullOrWhitespaceOnly(database) ? originalDb : database;
+                String dorisTable = converter.convert(originalTable);
+                String dorisTableKey = dorisDb + "." + dorisTable;
+
                 OutputTag<String> recordOutputTag =
-                        ParsingProcessFunction.createRecordOutputTag(dbTbl.f0, dbTbl.f1);
-                DataStream<String> sideOutput = parsedStream.getSideOutput(recordOutputTag);
+                        ParsingProcessFunction.createRecordOutputTag(dorisDb, dorisTable);
+                DataStream<String> dorisSideOutput = parsedStream.getSideOutput(recordOutputTag);
                 int sinkParallel =
                         sinkConfig.get(
-                                DorisConfigOptions.SINK_PARALLELISM, sideOutput.getParallelism());
-                String uidName = getUidName(targetDbSet, dbTbl);
-                sideOutput
-                        .sinkTo(buildDorisSink(dbTbl.f0 + "." + dbTbl.f1))
+                                DorisConfigOptions.SINK_PARALLELISM, dorisSideOutput.getParallelism());
+
+                String uidName = getUidName(targetDbSet, Tuple2.of(dorisDb, dorisTable));
+                dorisSideOutput
+                        .sinkTo(buildDorisSink(dorisTableKey))
                         .setParallelism(sinkParallel)
                         .name(uidName)
                         .uid(uidName);
 
-                // 每个表单独一个Kafka topic，topic格式：库名.表名（去掉ods前缀）
-                if (kafkaConfig != null) {
-                    // 去掉ods前缀
-                    String kafkaTopic = dbTbl.f0 + "." + dbTbl.f1;
-                    if (kafkaTopic.startsWith("ods_")) {
-                        kafkaTopic = kafkaTopic.substring(4);
-                    }
-                    // 获取该表对应的Kafka输出
-                    String tableKey = dbTbl.f0 + "." + dbTbl.f1;
-                    OutputTag<String> kafkaOutputTag = new OutputTag<String>("kafka-" + tableKey) {};
-                    DataStream<String> kafkaSideOutput = parsedStream.getSideOutput(kafkaOutputTag);
-                    kafkaSideOutput
-                            .sinkTo(buildKafkaSink(kafkaTopic))
-                            .setParallelism(sinkParallel)
-                            .name(uidName + "-kafka")
-                            .uid(uidName + "-kafka");
+                // Kafka侧流（使用原始db.table命名topic）
+                String kafkaTopic = originalDb + "." + originalTable;
+                if (kafkaTopic.startsWith("ods_")) {
+                    kafkaTopic = kafkaTopic.substring(4);
                 }
+
+                OutputTag<String> kafkaOutputTag = new OutputTag<>("kafka-" + kafkaTopic) {};
+                DataStream<String> kafkaSideOutput = parsedStream.getSideOutput(kafkaOutputTag);
+                kafkaSideOutput.sinkTo(buildKafkaSink(kafkaTopic))
+                               .setParallelism(sinkParallel)
+                               .name(kafkaTopic + "-kafka")
+                               .uid(kafkaTopic + "-kafka");
             }
         }
         return true;
