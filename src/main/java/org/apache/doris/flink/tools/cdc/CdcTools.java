@@ -60,6 +60,7 @@ public class CdcTools {
         String multiToOneOrigin = params.get(DatabaseSyncConfig.MULTI_TO_ONE_ORIGIN);
         String multiToOneTarget = params.get(DatabaseSyncConfig.MULTI_TO_ONE_TARGET);
         String schemaChangeMode = params.get(DatabaseSyncConfig.SCHEMA_CHANGE_MODE);
+        String kafkaOnlyTables = params.get(DatabaseSyncConfig.KAFKA_ONLY_TABLES);
         boolean createTableOnly = params.has(DatabaseSyncConfig.CREATE_TABLE_ONLY);
         boolean ignoreDefaultValue = params.has(DatabaseSyncConfig.IGNORE_DEFAULT_VALUE);
         boolean ignoreIncompatible = params.has(DatabaseSyncConfig.IGNORE_INCOMPATIBLE);
@@ -97,6 +98,7 @@ public class CdcTools {
                 .setSingleSink(singleSink)
                 .setIgnoreIncompatible(ignoreIncompatible)
                 .setSchemaChangeMode(schemaChangeMode)
+                .setKafkaOnlyTables(kafkaOnlyTables)
                 .setKafkaConfig(kafkaConfig)
                 .create();
 

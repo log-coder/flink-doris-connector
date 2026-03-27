@@ -75,4 +75,5 @@ public class DatabaseSyncConfig {
     public static final String KAFKA_PARTITIONS = "partitions";
     public static final String KAFKA_REPLICATION_FACTOR = "replication.factor";
     public static final String KAFKA_PROPERTIES = "properties";
+    public static final String KAFKA_ONLY_TABLES = "kafka-only-tables";
 }

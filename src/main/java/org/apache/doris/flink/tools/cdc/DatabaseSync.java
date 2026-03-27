@@ -75,6 +75,8 @@ public abstract class DatabaseSync {
 
     // Kafka配置
     protected Configuration kafkaConfig;
+    protected String kafkaOnlyTables;
+    protected Pattern kafkaOnlyPattern;
 
     public abstract void registerDriver() throws SQLException;
 
@@ -96,6 +98,7 @@ public abstract class DatabaseSync {
         this.excludingPattern = excludingTables == null ? null : Pattern.compile(excludingTables);
         this.multiToOneRulesPattern = multiToOneRulesParser(multiToOneOrigin, multiToOneTarget);
         this.converter = new TableNameConverter(tablePrefix, tableSuffix, multiToOneRulesPattern);
+        this.kafkaOnlyPattern = kafkaOnlyTables == null ? null : Pattern.compile(kafkaOnlyTables);
     }
 
     public boolean build() throws Exception {
@@ -156,31 +159,36 @@ public abstract class DatabaseSync {
             streamSource.sinkTo(buildDorisSink());
         } else {
             // 先解析数据，输出到Doris和Kafka
-            SingleOutputStreamOperator<Void> parsedStream = streamSource.process(new ParsingProcessFunction(database, converter));
+            SingleOutputStreamOperator<Void> parsedStream = streamSource.process(new ParsingProcessFunction(database, converter, kafkaOnlyTables));
 
             // 使用schemaList来获取原始db.table，构造Kafka侧流
             for (SourceSchema schema : schemaList) {
                 String originalDb = schema.getDatabaseName();
                 String originalTable = schema.getTableName();
 
-                // Doris侧流（使用转换后的表名）
-                String dorisDb = StringUtils.isNullOrWhitespaceOnly(database) ? originalDb : database;
-                String dorisTable = converter.convert(originalTable);
-                String dorisTableKey = dorisDb + "." + dorisTable;
+                // 判断是否是 kafka-only 表
+                boolean isKafkaOnly = isKafkaOnly(originalTable);
 
-                OutputTag<String> recordOutputTag =
-                        ParsingProcessFunction.createRecordOutputTag(dorisDb, dorisTable);
-                DataStream<String> dorisSideOutput = parsedStream.getSideOutput(recordOutputTag);
-                int sinkParallel =
-                        sinkConfig.get(
-                                DorisConfigOptions.SINK_PARALLELISM, dorisSideOutput.getParallelism());
+                // Doris侧流（使用转换后的表名）- kafka-only表不输出
+                if (!isKafkaOnly) {
+                    String dorisDb = StringUtils.isNullOrWhitespaceOnly(database) ? originalDb : database;
+                    String dorisTable = converter.convert(originalTable);
+                    String dorisTableKey = dorisDb + "." + dorisTable;
 
-                String uidName = getUidName(targetDbSet, Tuple2.of(dorisDb, dorisTable));
-                dorisSideOutput
-                        .sinkTo(buildDorisSink(dorisTableKey))
-                        .setParallelism(sinkParallel)
-                        .name(uidName)
-                        .uid(uidName);
+                    OutputTag<String> recordOutputTag =
+                            ParsingProcessFunction.createRecordOutputTag(dorisDb, dorisTable);
+                    DataStream<String> dorisSideOutput = parsedStream.getSideOutput(recordOutputTag);
+                    int sinkParallel =
+                            sinkConfig.get(
+                                    DorisConfigOptions.SINK_PARALLELISM, dorisSideOutput.getParallelism());
+
+                    String uidName = getUidName(targetDbSet, Tuple2.of(dorisDb, dorisTable));
+                    dorisSideOutput
+                            .sinkTo(buildDorisSink(dorisTableKey))
+                            .setParallelism(sinkParallel)
+                            .name(uidName)
+                            .uid(uidName);
+                }
 
                 // Kafka侧流（使用原始db.table命名topic）
                 String kafkaTopic = originalDb + "." + originalTable;
@@ -191,7 +199,7 @@ public abstract class DatabaseSync {
                 OutputTag<String> kafkaOutputTag = new OutputTag<>("kafka-" + kafkaTopic) {};
                 DataStream<String> kafkaSideOutput = parsedStream.getSideOutput(kafkaOutputTag);
                 kafkaSideOutput.sinkTo(buildKafkaSink(kafkaTopic))
-                               .setParallelism(sinkParallel)
+                               .setParallelism(sinkConfig.get(DorisConfigOptions.SINK_PARALLELISM, kafkaSideOutput.getParallelism()))
                                .name(kafkaTopic + "-kafka")
                                .uid(kafkaTopic + "-kafka");
             }
@@ -240,7 +248,7 @@ public abstract class DatabaseSync {
     }
 
     public ParsingProcessFunction buildProcessFunction() {
-        return new ParsingProcessFunction(database, converter);
+        return new ParsingProcessFunction(database, converter, kafkaOnlyTables);
     }
 
     /** create doris sink. */
@@ -592,6 +600,21 @@ public abstract class DatabaseSync {
     public DatabaseSync setKafkaConfig(Configuration kafkaConfig) {
         this.kafkaConfig = kafkaConfig;
         return this;
+    }
+
+    public DatabaseSync setKafkaOnlyTables(String kafkaOnlyTables) {
+        this.kafkaOnlyTables = kafkaOnlyTables;
+        return this;
+    }
+
+    /**
+     * 判断表是否只发Kafka不写Doris
+     */
+    protected boolean isKafkaOnly(String tableName) {
+        if (kafkaOnlyPattern == null) {
+            return false;
+        }
+        return kafkaOnlyPattern.matcher(tableName).matches();
     }
 
     /**
